@@ -1,0 +1,5 @@
+extract-msg>=0.48
+PyMuPDF>=1.23
+beautifulsoup4
+# optional: lets you drag .msg files from Explorer/Finder into the window
+tkinterdnd2
