@@ -44,13 +44,29 @@ jobs:
           if (-not (Test-Path $out)) { throw "no PDF was produced" }
           python -c "import pymupdf,sys; d=pymupdf.open(sys.argv[1]); n=sum(1 for p in d for a in p.annots()); print('pages', d.page_count, 'attachments', n); assert d.page_count > 5 and n > 0" $out
 
-      - name: Test the exe - open the window
+      - name: Test the exe - split into parts
+        shell: pwsh
+        run: |
+          $samples = "$env:RUNNER_TEMP\samples\example-msg-files"
+          $out = "$env:RUNNER_TEMP\split\emails.pdf"
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\split" | Out-Null
+          $p = Start-Process -FilePath dist\msg2pdf.exe -ArgumentList @("--cli", "`"$samples`"", "-o", "`"$out`"", "--split-every", "3", "--landscape") -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "split conversion exited with code $($p.ExitCode)" }
+          $parts = Get-ChildItem "$env:RUNNER_TEMP\split\emails_part*.pdf"
+          Write-Host "parts: $($parts.Count)"
+          if ($parts.Count -lt 2) { throw "expected several parts" }
+
+      - name: Test the exe - open the window, load, sort and move emails
         shell: pwsh
         run: |
           $report = "$env:RUNNER_TEMP\selftest.txt"
-          $p = Start-Process -FilePath dist\msg2pdf.exe -ArgumentList @("--selftest", "`"$report`"") -Wait -PassThru
+          $samples = "$env:RUNNER_TEMP\samples\example-msg-files"
+          $p = Start-Process -FilePath dist\msg2pdf.exe -ArgumentList @("--selftest", "`"$report`"", "`"$samples`"") -Wait -PassThru
           Get-Content $report
-          if ($p.ExitCode -ne 0) { throw "window self-test failed" }
+          if ($p.ExitCode -ne 0) {
+            Write-Host "::error::$((Get-Content $report -Raw) -replace "`r?`n", ' | ')"
+            throw "window self-test failed"
+          }
           if (-not ((Get-Content $report -Raw) -like "ok dnd=True*")) { throw "drag-and-drop support missing" }
 
       - uses: actions/upload-artifact@v4

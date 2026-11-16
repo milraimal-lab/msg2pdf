@@ -35,7 +35,7 @@ try:
 except Exception:
     pass
 
-PAGE_SIZES = {"A4": "a4", "Letter": "letter"}
+PAGE_SIZES = {"A4": "a4", "Letter": "letter", "Legal": "legal"}
 MARGIN = 40  # points
 ICON_SIZE = 12  # points, paperclip icon
 
@@ -124,6 +124,25 @@ def _open(path: str):
     return extract_msg.openMsg(path)
 
 
+def _decode_header_value(value: str) -> str:
+    """Decode RFC 2047 words (=?charset?B?...?=) leniently and unfold lines."""
+    from email.header import decode_header
+
+    value = re.sub(r"\r?\n[ \t]+", " ", value)
+    try:
+        parts = []
+        for chunk, charset in decode_header(value):
+            if isinstance(chunk, bytes):
+                try:
+                    chunk = chunk.decode(charset or "ascii", "replace")
+                except LookupError:
+                    chunk = chunk.decode("utf-8", "replace")
+            parts.append(chunk)
+        return "".join(parts)
+    except Exception:
+        return value
+
+
 def _field(msg, name: str, header_name: Optional[str] = None):
     """Read one property, tolerating decoding bugs in individual fields.
 
@@ -138,7 +157,9 @@ def _field(msg, name: str, header_name: Optional[str] = None):
         try:
             header = msg.header
             if header is not None:
-                return header.get(header_name)
+                value = header.get(header_name)
+                if value:
+                    return _decode_header_value(str(value))
         except Exception:
             pass
     return None
@@ -286,6 +307,7 @@ body { font-family: sans-serif; font-size: 10pt; }
 .m2p-toc-title { font-size: 18pt; font-weight: bold; margin-bottom: 10pt; }
 .m2p-toc td { padding: 2pt 6pt 2pt 0; vertical-align: top; font-size: 9.5pt; }
 .m2p-toc-subj { color: #1a4f9c; }
+.m2p-toc-sub { font-size: 10pt; color: #555555; margin: -6pt 0 10pt 0; }
 """
 
 
@@ -376,7 +398,8 @@ def _text_to_html(text: str) -> str:
     return '<div class="m2p-plain">' + out.replace("\n", "<br/>") + "</div>"
 
 
-def _build_email_html(content: EmailContent, archive: fitz.Archive, content_width: float):
+def _build_email_html(content: EmailContent, archive: fitz.Archive, content_width: float,
+                      embed: bool = True):
     """Return (css, html, attachment_ids) for one email.
 
     attachment_ids maps the HTML element id of each paperclip cell to the
@@ -417,7 +440,12 @@ def _build_email_html(content: EmailContent, archive: fitz.Archive, content_widt
         att_rows = []
         for i in listed:
             att = content.attachments[i]
-            if att.data is not None:
+            if att.data is not None and not embed:
+                att_rows.append(
+                    f'<tr><td style="width:{ICON_SIZE + 4}pt">&#160;</td>'
+                    f'<td>{e(att.filename)} <span class="m2p-size">({_human_size(len(att.data))})</span></td></tr>'
+                )
+            elif att.data is not None:
                 cell_id = f"m2p-att-{i}"
                 attachment_ids[cell_id] = i
                 size = f' <span class="m2p-size">({_human_size(len(att.data))})</span>'
@@ -489,11 +517,38 @@ def _rects_by_id(positions):
     return merged
 
 
-def _render_email(content: EmailContent, paper: str):
+@dataclass
+class Options:
+    paper: str = "A4"              # key of PAGE_SIZES
+    landscape: bool = False
+    include_toc: bool = True       # clickable "Contents" page at the front
+    page_numbers: bool = True      # "Page X of Y" footer
+    embed_attachments: bool = True  # False = list attachment names only (smaller PDF)
+    bookmarks: bool = True         # one PDF bookmark per email
+    split_every: int = 0           # >0: start a new PDF after this many emails
+    split_max_mb: float = 0        # >0: start a new PDF before it would exceed this size
+
+    @property
+    def paper_name(self) -> str:
+        name = PAGE_SIZES.get(self.paper, self.paper)
+        return name + "-l" if self.landscape else name
+
+
+@dataclass
+class Result:
+    files: list[str]
+    warnings: list[str]
+    emails: int
+    pages: int
+
+
+def _render_email(content: EmailContent, opts: Options):
+    paper = opts.paper_name
     archive = fitz.Archive()
     content_width = fitz.paper_rect(paper).width - 2 * MARGIN
+    embed = opts.embed_attachments
     try:
-        email_css, page_html, att_ids = _build_email_html(content, archive, content_width)
+        email_css, page_html, att_ids = _build_email_html(content, archive, content_width, embed)
         doc, positions = _render_story(page_html, BASE_CSS + "\n" + email_css, archive, paper)
     except Exception as exc:
         # Fall back to the plain-text body if the HTML trips up the renderer.
@@ -501,7 +556,7 @@ def _render_email(content: EmailContent, paper: str):
         if not content.text_body:
             content.text_body = f"(The body of this email could not be rendered: {exc})"
         archive = fitz.Archive()
-        _css, page_html, att_ids = _build_email_html(content, archive, content_width)
+        _css, page_html, att_ids = _build_email_html(content, archive, content_width, embed)
         doc, positions = _render_story(page_html, BASE_CSS, archive, paper)
     return doc, positions, att_ids
 
@@ -534,18 +589,19 @@ def _embed_attachments(out: fitz.Document, page_offset: int, positions, att_ids,
             pass
 
 
-def _build_toc_pages(entries, paper: str):
-    """entries: list of (EmailInfo, target_page_index_without_toc)."""
+def _build_toc_pages(entries, paper: str, subtitle: str = ""):
+    """entries: list of (number, EmailInfo, target_page_index_without_toc)."""
     e = html.escape
     rows = []
-    for n, (info, _page) in enumerate(entries):
+    for n, (num, info, _page) in enumerate(entries):
         rows.append(
-            f'<tr><td>{n + 1}.</td><td>{e(info.date_text)}</td>'
+            f'<tr><td>{num}.</td><td style="white-space:nowrap">{e(info.date_text)}</td>'
             f'<td>{e(info.sender)}</td>'
             f'<td id="m2p-toc-{n}"><span class="m2p-toc-subj">{e(info.subject or "(no subject)")}</span></td></tr>'
         )
+    sub = f'<div class="m2p-toc-sub">{e(subtitle)}</div>' if subtitle else ""
     page_html = (
-        '<html><body><div class="m2p-toc-title">Contents</div>'
+        f'<html><body><div class="m2p-toc-title">Contents</div>{sub}'
         '<table class="m2p-toc"><tr><td class="m2p-lbl">#</td><td class="m2p-lbl">Sent</td>'
         '<td class="m2p-lbl">From</td><td class="m2p-lbl">Subject</td></tr>'
         + "".join(rows)
@@ -554,32 +610,74 @@ def _build_toc_pages(entries, paper: str):
     return _render_story(page_html, BASE_CSS, None, paper)
 
 
+def _add_page_numbers(doc: fitz.Document) -> None:
+    total = doc.page_count
+    for i, page in enumerate(doc):
+        text = f"Page {i + 1} of {total}"
+        width = fitz.get_text_length(text, fontname="helv", fontsize=8)
+        r = page.rect
+        page.insert_text(((r.width - width) / 2, r.height - MARGIN / 2), text,
+                         fontname="helv", fontsize=8, color=(0.45, 0.45, 0.45))
+
+
+def part_path(output_pdf: str, part: int) -> str:
+    base, ext = os.path.splitext(output_pdf)
+    return f"{base}_part{part:02d}{ext or '.pdf'}"
+
+
+class _Part:
+    def __init__(self):
+        self.doc = fitz.open()
+        self.entries = []  # (email number, EmailInfo, start page)
+        self.size = 0      # rough size estimate in bytes
+
+
 ProgressFn = Callable[[int, int, str], None]
 
 
 def convert(
     paths: list[str],
     output_pdf: str,
-    paper: str = "A4",
-    include_toc: bool = True,
+    options: Optional[Options] = None,
     progress: Optional[ProgressFn] = None,
-) -> list[str]:
+) -> Result:
     """Convert `paths` (in the given order) into `output_pdf`.
 
-    Returns a list of warning strings (files that failed, attachments that
-    could not be embedded, ...).  Raises on fatal errors (e.g. cannot write the
-    output file).
+    If splitting is enabled and more than one part is needed, the parts are
+    written as <name>_part01.pdf, <name>_part02.pdf, ...  Each part is saved and
+    released as soon as it is full, so memory use stays bounded.
+
+    Raises on fatal errors (e.g. the output file cannot be written).
     """
-    paper = PAGE_SIZES.get(paper, paper)
+    if not paths:
+        raise ValueError("No emails to convert.")
+    opts = options or Options()
+    paper = opts.paper_name
     warnings: list[str] = []
-    out = fitz.open()
-    entries = []  # (EmailInfo, start page)
     total = len(paths)
+    max_bytes = int(opts.split_max_mb * 1024 * 1024) if opts.split_max_mb else 0
+    saved: list[tuple[str, _Part, int]] = []  # (path, part, pages) – part.doc closed
+    pages_total = 0
+    cur = _Part()
+
+    def finish(part: _Part, number: int, last: bool) -> None:
+        nonlocal pages_total
+        path = output_pdf if (last and number == 1) else part_path(output_pdf, number)
+        if progress:
+            progress(min(len(paths), part.entries[-1][0]), total, f"Writing {os.path.basename(path)}")
+        first, last_num = part.entries[0][0], part.entries[-1][0]
+        if last and number == 1:
+            subtitle = f"{len(part.entries)} emails"
+        else:
+            subtitle = f"Part {number} · emails {first}–{last_num} of {total}"
+        pages = _finish_part(part, path, paper, opts, subtitle)
+        pages_total += pages
+        saved.append((path, part, pages))
 
     for n, path in enumerate(paths):
         name = os.path.basename(path)
         if progress:
-            progress(n, total, f"Converting {name}")
+            progress(n, total, f"Converting {name}  ({n + 1} of {total})")
         try:
             content = read_content(path)
         except Exception as exc:
@@ -592,24 +690,47 @@ def convert(
             if att.data is None:
                 warnings.append(f"{name}: attachment '{att.filename}' {att.note}")
 
-        doc, positions, att_ids = _render_email(content, paper)
-        start = out.page_count
-        out.insert_pdf(doc)
+        doc, positions, att_ids = _render_email(content, opts)
+        estimate = len(doc.tobytes(garbage=0, deflate=True))
+        if opts.embed_attachments:
+            estimate += sum(len(content.attachments[i].data or b"") for i in att_ids.values())
+
+        if cur.entries and (
+            (opts.split_every and len(cur.entries) >= opts.split_every)
+            or (max_bytes and cur.size + estimate > max_bytes)
+        ):
+            finish(cur, len(saved) + 1, last=False)
+            cur = _Part()
+
+        start = cur.doc.page_count
+        cur.doc.insert_pdf(doc)
         doc.close()
-        _embed_attachments(out, start, positions, att_ids, content)
-        entries.append((content.info, start))
+        if opts.embed_attachments:
+            _embed_attachments(cur.doc, start, positions, att_ids, content)
+        cur.entries.append((n + 1, content.info, start))
+        cur.size += estimate
+        if max_bytes and estimate > max_bytes:
+            warnings.append(f"{name}: is larger than the size limit on its own (~{_human_size(estimate)})")
 
+    if cur.entries:
+        finish(cur, len(saved) + 1, last=True)
+
+    files = [p for p, _part, _pages in saved]
     if progress:
-        progress(total, total, "Writing PDF")
+        progress(total, total, "Done")
+    return Result(files=files, warnings=warnings, emails=total, pages=pages_total)
 
+
+def _finish_part(part: _Part, path: str, paper: str, opts: Options, subtitle: str) -> int:
+    out = part.doc
     toc_pages = 0
-    if include_toc and entries:
-        toc_doc, toc_positions = _build_toc_pages(entries, paper)
+    if opts.include_toc and part.entries:
+        toc_doc, toc_positions = _build_toc_pages(part.entries, paper, subtitle)
         toc_pages = toc_doc.page_count
         out.insert_pdf(toc_doc, start_at=0)
         toc_doc.close()
         rects = _rects_by_id(toc_positions)
-        for n, (_info, start) in enumerate(entries):
+        for n, (_num, _info, start) in enumerate(part.entries):
             key = f"m2p-toc-{n}"
             if key in rects:
                 page_index, rect = rects[key]
@@ -617,21 +738,24 @@ def convert(
                     {"kind": fitz.LINK_GOTO, "from": rect, "page": start + toc_pages, "to": fitz.Point(0, 0)}
                 )
 
-    # Bookmarks (outline) – one per email.
-    outline = []
-    if toc_pages:
-        outline.append([1, "Contents", 1])
-    for info, start in entries:
-        title = info.subject or os.path.basename(info.path)
-        if info.date_text:
-            title = f"{info.date_text}  {title}"
-        outline.append([1, title, start + toc_pages + 1])
-    if outline:
-        out.set_toc(outline)
+    if opts.bookmarks:
+        outline = []
+        if toc_pages:
+            outline.append([1, "Contents", 1])
+        for _num, info, start in part.entries:
+            title = info.subject or os.path.basename(info.path)
+            if info.date_text:
+                title = f"{info.date_text}  {title}"
+            outline.append([1, title, start + toc_pages + 1])
+        if outline:
+            out.set_toc(outline)
+
+    if opts.page_numbers:
+        _add_page_numbers(out)
 
     out.set_metadata({"title": "Emails", "creator": "msg2pdf", "producer": "msg2pdf (PyMuPDF)"})
-    out.save(output_pdf, garbage=3, deflate=True)
+    pages = out.page_count
+    out.save(path, garbage=3, deflate=True)
     out.close()
-    if progress:
-        progress(total, total, "Done")
-    return warnings
+    part.doc = None
+    return pages
