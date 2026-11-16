@@ -293,8 +293,9 @@ class App:
         insert_at = remaining.index(target)
         if target_idx > children.index(sel_sorted[0]):
             insert_at += 1  # dragging downwards: drop after target
-        for offset, iid in enumerate(sel_sorted):
-            self.tree.move(iid, "", insert_at + offset)
+        new_order = remaining[:insert_at] + sel_sorted + remaining[insert_at:]
+        for n, iid in enumerate(new_order):
+            self.tree.move(iid, "", n)
         self._clear_sort_arrows()
 
     def _on_release(self, event):

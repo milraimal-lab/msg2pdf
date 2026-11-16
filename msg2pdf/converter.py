@@ -17,13 +17,23 @@ from datetime import datetime
 from typing import Callable, Optional
 
 import extract_msg
-import fitz  # PyMuPDF
+try:
+    import pymupdf as fitz  # PyMuPDF >= 1.24
+except ImportError:  # older PyMuPDF
+    import fitz
 
 try:
     from bs4 import BeautifulSoup
 except ImportError:  # bs4 is a dependency of extract-msg, but be defensive
     BeautifulSoup = None
 
+
+# MuPDF prints harmless warnings (e.g. CSS it doesn't support) to stderr.
+try:
+    fitz.TOOLS.mupdf_display_errors(False)
+    fitz.TOOLS.mupdf_display_warnings(False)
+except Exception:
+    pass
 
 PAGE_SIZES = {"A4": "a4", "Letter": "letter"}
 MARGIN = 40  # points
@@ -114,6 +124,26 @@ def _open(path: str):
     return extract_msg.openMsg(path)
 
 
+def _field(msg, name: str, header_name: Optional[str] = None):
+    """Read one property, tolerating decoding bugs in individual fields.
+
+    If the property can't be decoded, fall back to the raw internet header
+    (e.g. "To"/"Cc"), which is usually present for received mail.
+    """
+    try:
+        return getattr(msg, name, None)
+    except Exception:
+        pass
+    if header_name:
+        try:
+            header = msg.header
+            if header is not None:
+                return header.get(header_name)
+        except Exception:
+            pass
+    return None
+
+
 def _attachment_name(att, index: int) -> str:
     name = None
     for attr in ("longFilename", "shortFilename", "displayName", "name"):
@@ -190,10 +220,10 @@ def read_info(path: str) -> EmailInfo:
     info = EmailInfo(path=path)
     try:
         with _open(path) as msg:
-            info.subject = _s(getattr(msg, "subject", ""))
-            info.sender = _s(getattr(msg, "sender", ""))
-            info.to = _s(getattr(msg, "to", ""))
-            info.date = _parse_date(getattr(msg, "date", None))
+            info.subject = _s(_field(msg, "subject", "Subject"))
+            info.sender = _s(_field(msg, "sender", "From"))
+            info.to = _s(_field(msg, "to", "To"))
+            info.date = _parse_date(_field(msg, "date", "Date"))
             try:
                 info.attachment_count = len(getattr(msg, "attachments", None) or [])
             except Exception:
@@ -209,18 +239,18 @@ def read_content(path: str) -> EmailContent:
     if info.error:
         return content
     with _open(path) as msg:
-        content.cc = _s(getattr(msg, "cc", ""))
+        content.cc = _s(_field(msg, "cc", "Cc"))
         try:
             body = msg.htmlBody
             if body:
                 if isinstance(body, bytes):
                     content.html_body = _decode_html(body)
                 else:
-                    content.html_body = str(body)
+                    content.html_body = str(body).replace("\x00", "")
         except Exception:
             content.html_body = None
         try:
-            content.text_body = _s(getattr(msg, "body", ""))
+            content.text_body = _s(_field(msg, "body"))
         except Exception:
             content.text_body = ""
         content.attachments = _attachments(msg)
@@ -228,6 +258,7 @@ def read_content(path: str) -> EmailContent:
 
 
 def _decode_html(body: bytes) -> str:
+    body = body.rstrip(b"\x00")
     m = re.search(rb'charset\s*=\s*["\']?([A-Za-z0-9_\-]+)', body[:4000])
     enc = m.group(1).decode("ascii", "replace") if m else "utf-8"
     try:
@@ -286,6 +317,9 @@ def _clean_email_html(raw: str, inline: dict[str, str], content_width: float):
         tag.decompose()
 
     css = "\n".join(s.get_text() for s in soup.find_all("style"))
+    css = re.sub(r"<!--|-->", "", css)
+    css = re.sub(r"@page[^{]*\{[^}]*\}", "", css)  # Outlook/Word page setup rules
+    css = re.sub(r"@(font-face|list)[^{]*\{[^}]*\}", "", css)
     for s in soup.find_all("style"):
         s.decompose()
 
@@ -388,16 +422,16 @@ def _build_email_html(content: EmailContent, archive: fitz.Archive, content_widt
                 attachment_ids[cell_id] = i
                 size = f' <span class="m2p-size">({_human_size(len(att.data))})</span>'
                 att_rows.append(
-                    f'<tr><td id="{cell_id}" width="{ICON_SIZE + 6}">&#160;</td>'
+                    f'<tr><td id="{cell_id}" style="width:{ICON_SIZE + 4}pt">&#160;</td>'
                     f'<td><span class="m2p-attname">{e(att.filename)}</span>{size}</td></tr>'
                 )
             else:
                 att_rows.append(
-                    f'<tr><td width="{ICON_SIZE + 6}">&#160;</td>'
+                    f'<tr><td style="width:{ICON_SIZE + 4}pt">&#160;</td>'
                     f'<td>{e(att.filename)} <span class="m2p-note">({e(att.note)})</span></td></tr>'
                 )
         parts.append(
-            f'<table class="m2p-hdr"><tr><td class="m2p-lbl">Attachments ({len(listed)}):</td></tr></table>'
+            f'<div class="m2p-hdr m2p-lbl">Attachments ({len(listed)}):</div>'
             '<table class="m2p-att">' + "".join(att_rows) + "</table>"
         )
     parts.append('<div class="m2p-rule"></div>')
@@ -435,7 +469,7 @@ def _render_story(page_html: str, css: str, archive, paper: str):
 
     def positionfn(pos):
         if getattr(pos, "id", None):
-            page = getattr(pos, "page_num", getattr(pos, "pagenum", 0))
+            page = getattr(pos, "page_num", 1) - 1  # Story reports 1-based pages
             positions.append((page, pos.id, fitz.Rect(pos.rect)))
 
     doc = story.write_with_links(rectfn, positionfn)
