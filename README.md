@@ -28,7 +28,16 @@ attachments are **embedded in the PDF**, so you click an attachment to open it.
 > Chrome/Edge built-in viewer, may show the paperclip without letting you open
 > the file.
 
-## Install and run
+## Download (Windows, no Python needed)
+
+Download **msg2pdf.exe** from the
+[latest release](https://github.com/milraimal-lab/msg2pdf/releases/tag/latest)
+and double-click it. Every push to `main` rebuilds and tests the .exe.
+
+Windows SmartScreen may warn about an unknown publisher, because the .exe
+isn't code-signed. Click **More info → Run anyway**.
+
+## Install and run from source
 
 1. Install Python 3.9 or newer from <https://python.org>.
 2. In this folder, run:
@@ -43,13 +52,15 @@ attachments are **embedded in the PDF**, so you click an attachment to open it.
    python -m msg2pdf
    ```
 
-### Make a standalone Windows .exe (optional)
+### Build the .exe yourself (optional)
+
+From a Python command prompt (e.g. *WinPython Command Prompt*), in this folder:
 
 ```bash
-pip install pyinstaller
+build.bat
 ```
 
-Then double-click `build_exe.bat`. The program will be in `dist\msg2pdf.exe`.
+The program will be in `dist\msg2pdf.exe`.
 
 ### Command line (optional)
 

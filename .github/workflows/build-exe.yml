@@ -8,6 +8,11 @@ on:
 permissions:
   contents: write  # to publish the "latest" release
 
+# Only the newest push matters; cancel older builds so they can't race on the release.
+concurrency:
+  group: build-exe-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest
