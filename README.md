@@ -54,7 +54,7 @@ isn't code-signed. Click **More info → Run anyway**.
 
 ### Build the .exe yourself (optional)
 
-From a Python command prompt (e.g. *WinPython Command Prompt*), in this folder:
+Double-click `build.bat`. It finds a WinPython folder next to this one (e.g. `F:\Py\WPy64-…`), or Python on PATH. Or run it from a Python command prompt:
 
 ```bash
 build.bat
